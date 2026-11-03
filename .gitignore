@@ -1,0 +1,91 @@
+
+# ==============================
+# Environment variables & secrets
+# ==============================
+.env
+.env.*
+!.env.example
+
+# ==============================
+# Python
+# ==============================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+
+# ==============================
+# Testing & Coverage
+# ==============================
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.pyright/
+.ruff_cache/
+
+# ==============================
+# Jupyter Notebook
+# ==============================
+.ipynb_checkpoints/
+
+# ==============================
+# IDE & Editors
+# ==============================
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# ==============================
+# Logs
+# ==============================
+*.log
+logs/
+
+# ==============================
+# Application artifacts
+# ==============================
+uploads/
+temp/
+tmp/
+*.pdf
+
+# ==============================
+# Vector databases & local data
+# ==============================
+chroma_db/
+chroma/
+vector_store/
+*.sqlite3
+*.db
+
+# ==============================
+# Celery / Worker
+# ==============================
+celerybeat-schedule
+celerybeat.pid
+
+# ==============================
+# Build / Distribution
+# ==============================
+site/
+.cache/

@@ -1,0 +1,26 @@
+[project]
+name = "multi-agent-deep-research-ai"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "alembic>=1.20.1",
+    "arq>=0.28.0",
+    "asyncpg>=0.32.0",
+    "email-validator>=2.3.0",
+    "fastapi>=0.162.0",
+    "langchain>=1.4.7",
+    "langchain-community>=0.4.2",
+    "langchain-openai>=1.7.3",
+    "langchain-openrouter>=0.2.9",
+    "langgraph>=1.2.19",
+    "pwdlib[argon2]>=0.3.1",
+    "pydantic-settings>=2.16.2",
+    "python-dotenv>=1.2.4",
+    "python-jose[cryptography]>=3.5.0",
+    "rich>=15.0.0",
+    "sqlalchemy[asyncio]>=2.1.6",
+    "tavily-python>=0.8.5",
+    "uvicorn[standard]>=0.54.0",
+]
