@@ -43,6 +43,8 @@ class ResearchTaskResponse(BaseModel):
     title: str
     description: str | None
     status: str
+    result: str | None
+    error: str | None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -55,3 +57,23 @@ class ResearchReportResponse(BaseModel):
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class ResearchSourceResponse(BaseModel):
+    id: str
+    url: str
+    title: str | None
+    snippet: str | None
+    source_metadata: dict | None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ResearchListResponse(BaseModel):
+    items: list[ResearchResponse]
+    total: int
+    page: int
+    limit: int
+    total_pages: int
+    has_more: bool

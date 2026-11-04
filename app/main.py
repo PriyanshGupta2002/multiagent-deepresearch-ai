@@ -2,8 +2,17 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.core.config import settings
+from app.core.exceptions import (
+    AppException,
+    app_exception_handler,
+    http_exception_handler,
+    unexpected_exception_handler,
+    validation_exception_handler,
+)
 from app.core.queue import create_redis_pool
 
 from app.modules.auth.router import router as auth_router
@@ -24,6 +33,12 @@ app = FastAPI(
     title=settings.APP_NAME,
     version=settings.APP_VERSION,
     lifespan=lifespan,
+    exception_handlers={
+        AppException: app_exception_handler,
+        RequestValidationError: validation_exception_handler,
+        StarletteHTTPException: http_exception_handler,
+        Exception: unexpected_exception_handler,
+    },
 )
 
 

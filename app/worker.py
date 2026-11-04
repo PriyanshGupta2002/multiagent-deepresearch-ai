@@ -19,9 +19,14 @@ from app.modules.research.constants import RESEARCH_DEPTH_CONFIG
 
 from app.graph.workflow import research_graph
 
-from sqlalchemy import select, func
+from sqlalchemy import select, func, update
 
 from app.modules.research.models import ResearchTask
+
+import asyncio
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 async def health_check(ctx):
@@ -104,343 +109,42 @@ async def update_research_task(
         await db.commit()
 
 
-# async def run_research(ctx, research_id: str):
-
-#     # 1. Fetch research job
-#     async with AsyncSessionLocal() as db:
-
-#         job = await db.get(ResearchJob, research_id)
-
-#         if not job:
-#             raise ValueError(f"Research job {research_id} not found")
-
-#         if job.status == "cancelled":
-#             return {"status": "cancelled"}
-
-#         job.status = "running"
-#         job.started_at = datetime.now(timezone.utc)
-
-#         query = job.query
-#         depth = job.depth
-
-#         await db.commit()
-
-#     try:
-#         # 2. Load depth configuration
-#         depth_config = RESEARCH_DEPTH_CONFIG[depth]
-
-#         # 3. Build initial graph state
-#         initial_state = {
-#             "topic": query,
-#             "depth": depth,
-#             **depth_config,
-#             "tasks": [],
-#             "research_results": [],
-#             "completed_tasks": [],
-#             "failed_tasks": [],
-#             "aggregated_results": None,
-#             "critic_score": 0.0,
-#             "critic_feedback": "",
-#             "critic_acceptable": False,
-#             "missing_areas": [],
-#             "unsupported_claims": [],
-#             "improvement_suggestions": [],
-#             "retry_tasks": [],
-#             "retry_count": 0,
-#             "final_research": "",
-#         }
-
-#         # 4. Configure LangGraph concurrency
-#         graph_config = {
-#             "recursion_limit": 50,
-#             "max_concurrency": depth_config["max_concurrent_researchers"],
-#         }
-
-#         print(
-#             f"Starting research: {research_id} | "
-#             f"Depth: {depth} | "
-#             f"Concurrency: {graph_config['max_concurrency']}"
-#         )
-
-#         await save_research_event(
-#             research_id,
-#             "research_started",
-#             {
-#                 "query": query,
-#                 "depth": depth,
-#             },
-#         )
-
-#         # 5. Execute existing research graph
-#         final_state = None
-
-#         async for event in research_graph.astream_events(
-#             initial_state,
-#             version="v2",
-#             config=graph_config,
-#         ):
-#             event_name = event.get("event")
-#             node_name = event.get("name")
-#             event_data = event.get("data", {})
-#             metadata = event.get("metadata", {})
-
-#             # --------------------------------------------------
-#             # 1. Custom researcher events
-#             # --------------------------------------------------
-
-#             if event_name == "on_custom_event":
-
-#                 custom_name = node_name
-#                 payload = event_data if isinstance(event_data, dict) else {}
-
-#                 subtask = payload.get("subtask")
-
-#                 if custom_name == "researcher_started":
-#                     await update_research_task(
-#                         research_id=research_id,
-#                         subtask=subtask,
-#                         status="running",
-#                     )
-
-#                 elif custom_name == "researcher_completed":
-#                     await update_research_task(
-#                         research_id=research_id,
-#                         subtask=subtask,
-#                         status="completed",
-#                     )
-#                     await save_research_event(
-#                         research_id,
-#                         "research_completed",
-#                         {
-#                             "status": "completed",
-#                             "retry_count": final_state["retry_count"],
-#                             "critic_score": final_state["critic_score"],
-#                         },
-#                     )
-
-#                 elif custom_name == "researcher_failed":
-#                     await update_research_task(
-#                         research_id=research_id,
-#                         subtask=subtask,
-#                         status="failed",
-#                         error=payload.get("error"),
-#                     )
-
-#                 await save_research_event(
-#                     research_id,
-#                     custom_name,
-#                     payload,
-#                 )
-
-#                 print(f"[EVENT SAVED] {custom_name}")
-
-#                 continue
-
-#             # --------------------------------------------------
-#             # 2. Identify LangGraph node lifecycle events
-#             # --------------------------------------------------
-
-#             graph_node = metadata.get("langgraph_node") or node_name
-
-#             if graph_node in {
-#                 "supervisor",
-#                 "aggregator",
-#                 "critic",
-#                 "retry",
-#                 "final_report",
-#             }:
-
-#                 if event_name == "on_chain_start":
-
-#                     await save_research_event(
-#                         research_id,
-#                         f"{graph_node}_started",
-#                         {},
-#                     )
-
-#                     print(f"[NODE STARTED] {graph_node}")
-
-#                 elif event_name == "on_chain_end":
-
-#                     output = event_data.get("output", {})
-
-#                     # Supervisor generated research tasks.
-#                     if graph_node == "supervisor":
-#                         tasks = output.get("tasks", [])
-
-#                         if tasks:
-#                             await persist_generated_tasks(
-#                                 research_id=research_id,
-#                                 tasks=tasks,
-#                             )
-
-#                             await save_research_event(
-#                                 research_id,
-#                                 "tasks_generated",
-#                                 {
-#                                     "tasks": tasks,
-#                                     "total_tasks": len(tasks),
-#                                 },
-#                             )
-
-#                             print(f"[TASKS SAVED] {len(tasks)} tasks")
-
-#                     # Save critic's evaluation.
-#                     elif graph_node == "critic":
-#                         await save_research_event(
-#                             research_id,
-#                             "critic_completed",
-#                             {
-#                                 "critic_score": output.get("critic_score"),
-#                                 "critic_acceptable": output.get("critic_acceptable"),
-#                                 "critic_feedback": output.get("critic_feedback"),
-#                                 "retry_tasks": output.get("retry_tasks", []),
-#                             },
-#                         )
-
-#                     # Save retry information.
-#                     elif graph_node == "retry":
-#                         await save_research_event(
-#                             research_id,
-#                             "retry_started",
-#                             {
-#                                 "retry_count": output.get("retry_count"),
-#                                 "retry_tasks": output.get("retry_tasks", []),
-#                             },
-#                         )
-
-#                     # Save final report generation event.
-#                     elif graph_node == "final_report":
-#                         await save_research_event(
-#                             research_id,
-#                             "final_report_completed",
-#                             {
-#                                 "report_generated": bool(output.get("final_research")),
-#                             },
-#                         )
-
-#                     # Save aggregator completion.
-#                     elif graph_node == "aggregator":
-#                         await save_research_event(
-#                             research_id,
-#                             "aggregator_completed",
-#                             {},
-#                         )
-
-#                     print(f"[NODE COMPLETED] {graph_node}")
-
-#         # --------------------------------------------------
-#         # 3. Capture final output from root graph
-#         # --------------------------------------------------
-
-#         if event_name == "on_chain_end" and not event.get("parent_ids"):
-#             final_state = event_data.get("output")
-
-#             if not final_state:
-#                 raise RuntimeError("Research graph returned no final state")
-
-#             if not final_state.get("final_research"):
-#                 raise RuntimeError("Final research report is empty")
-
-#             # 6. Persist report and sources
-#             aggregated = final_state["aggregated_results"]
-
-#             if hasattr(aggregated, "model_dump"):
-#                 structured_content = aggregated.model_dump(mode="json")
-#             else:
-#                 structured_content = aggregated
-
-#             structured_content = {
-#                 "aggregated_results": structured_content,
-#                 "critic_score": final_state["critic_score"],
-#                 "critic_feedback": final_state["critic_feedback"],
-#                 "retry_count": final_state["retry_count"],
-#             }
-
-#             async with AsyncSessionLocal() as db:
-
-#                 report = ResearchReport(
-#                     research_id=research_id,
-#                     content=final_state["final_research"],
-#                     structured_content=structured_content,
-#                 )
-
-#                 db.add(report)
-
-#                 # Deduplicate sources by URL
-#                 seen_urls = set()
-
-#                 for source in aggregated.sources:
-
-#                     if source.url in seen_urls:
-#                         continue
-
-#                     seen_urls.add(source.url)
-
-#                     db.add(
-#                         ResearchSource(
-#                             research_id=research_id,
-#                             url=source.url,
-#                             title=source.title,
-#                             source_metadata={
-#                                 "published_date": source.published_date,
-#                             },
-#                         )
-#                     )
-
-#                 job = await db.get(ResearchJob, research_id)
-
-#                 job.status = "completed"
-#                 job.completed_at = datetime.now(timezone.utc)
-
-#                 await db.commit()
-
-#             return {
-#                 "status": "completed",
-#                 "research_id": research_id,
-#             }
-
-#     except Exception as e:
-
-#         async with AsyncSessionLocal() as db:
-
-#             job = await db.get(ResearchJob, research_id)
-
-#             if job:
-#                 job.status = "failed"
-#                 job.error = str(e)
-#                 job.completed_at = datetime.now(timezone.utc)
-
-#                 await db.commit()
-
-#         await save_research_event(
-#             research_id,
-#             "research_failed",
-#             {
-#                 "status": "failed",
-#                 "error": str(e),
-#             },
-#         )
-
-
 async def run_research(ctx, research_id: str):
 
-    # 1. Fetch research job
+    # 1. Atomically claim the queued research job.
     async with AsyncSessionLocal() as db:
-        job = await db.get(ResearchJob, research_id)
+        result = await db.execute(
+            update(ResearchJob)
+            .where(
+                ResearchJob.id == research_id,
+                ResearchJob.status == "queued",
+            )
+            .values(
+                status="running",
+                started_at=datetime.now(timezone.utc),
+            )
+            .returning(ResearchJob.query, ResearchJob.depth)
+        )
+        claimed_job = result.one_or_none()
 
-        if not job:
-            raise ValueError(f"Research job {research_id} not found")
+        if claimed_job is None:
+            job_status = await db.scalar(
+                select(ResearchJob.status).where(ResearchJob.id == research_id)
+            )
+            if job_status is None:
+                raise ValueError(f"Research job {research_id} not found")
 
-        if job.status == "cancelled":
-            return {"status": "cancelled"}
+            await db.rollback()
+            logger.info(
+                "Skipping research job %s because its status is %s",
+                research_id,
+                job_status,
+            )
+            return {"status": job_status}
 
-        job.status = "running"
-        job.started_at = datetime.now(timezone.utc)
+        query, depth = claimed_job
 
-        query = job.query
-        depth = job.depth
-
+        # Commit the claim before starting graph execution.
         await db.commit()
 
     try:
@@ -750,6 +454,12 @@ async def run_research(ctx, research_id: str):
             "research_id": research_id,
         }
 
+    except asyncio.CancelledError:
+        logger.info(
+            "Research %s was cancelled by ARQ",
+            research_id,
+        )
+        raise
     except Exception as e:
 
         async with AsyncSessionLocal() as db:
@@ -801,3 +511,4 @@ class WorkerSettings:
     max_jobs = 5
     job_timeout = 3600
     max_tries = 1
+    allow_abort_jobs = True

@@ -1,6 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Query, Header
+from fastapi import APIRouter, Depends, status, Query, Header, Request
 from sqlalchemy.ext.asyncio import AsyncSession
-from fastapi import Request
+from app.core.exceptions import AppException
 from app.db.dependencies import get_db
 from app.modules.auth.dependencies import get_current_user
 from app.modules.auth.models import User
@@ -8,6 +8,10 @@ from fastapi.responses import StreamingResponse
 from app.modules.research.schemas import (
     ResearchCreateRequest,
     ResearchResponse,
+    ResearchTaskResponse,
+    ResearchReportResponse,
+    ResearchSourceResponse,
+    ResearchListResponse,
 )
 from app.modules.research.services import (
     create_research,
@@ -15,6 +19,10 @@ from app.modules.research.services import (
     get_research_by_id,
     cancel_research,
     research_event_stream,
+    get_research_report,
+    get_research_tasks,
+    get_research_sources,
+    mark_research_enqueue_failed,
 )
 
 router = APIRouter(
@@ -42,37 +50,39 @@ async def start_research(
     )
 
     try:
+        job_id = f"research:{research.id}"
         await request.app.state.redis_pool.enqueue_job(
-            "run_research",
-            research.id,
-            _queue_name="deepresearch",
+            "run_research", research.id, _queue_name="deepresearch", _job_id=job_id
         )
 
-    except Exception:
+    except Exception as exc:
         # Avoid leaving a permanently queued job
-        research.status = "failed"
-        research.error = "Failed to enqueue research job"
-        await db.commit()
-
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Research service is temporarily unavailable",
+        await mark_research_enqueue_failed(
+            db=db,
+            research=research,
+            error="Failed to enqueue research job",
         )
+
+        raise AppException(
+            message="Research service is temporarily unavailable",
+            error_code="RESEARCH_ENQUEUE_FAILED",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        ) from exc
 
     return research
 
 
-@router.get("", response_model=list[ResearchResponse])
+@router.get("", response_model=ResearchListResponse)
 async def list_researches(
-    skip: int = Query(default=0, ge=0),
-    limit: int = Query(default=20, ge=1, le=100),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     return await get_user_researches(
         db=db,
         user_id=current_user.id,
-        skip=skip,
+        page=page,
         limit=limit,
     )
 
@@ -90,9 +100,10 @@ async def get_research(
     )
 
     if not research:
-        raise HTTPException(
+        raise AppException(
+            message="Research not found",
+            error_code="RESEARCH_NOT_FOUND",
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Research not found",
         )
 
     return research
@@ -101,6 +112,7 @@ async def get_research(
 @router.post("/{research_id}/cancel", response_model=ResearchResponse)
 async def cancel_research_endpoint(
     research_id: str,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -111,19 +123,17 @@ async def cancel_research_endpoint(
     )
 
     if not research:
-        raise HTTPException(
+        raise AppException(
+            message="Research not found",
+            error_code="RESEARCH_NOT_FOUND",
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Research not found",
         )
 
-    try:
-        return await cancel_research(db, research)
-
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=str(e),
-        )
+    return await cancel_research(
+        db=db,
+        research=research,
+        redis_pool=request.app.state.redis_pool,
+    )
 
 
 @router.get("/{research_id}/events")
@@ -145,9 +155,10 @@ async def stream_research_events(
     )
 
     if not research:
-        raise HTTPException(
+        raise AppException(
+            message="Research not found",
+            error_code="RESEARCH_NOT_FOUND",
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Research not found",
         )
 
     # 2. Validate Last-Event-ID.
@@ -158,9 +169,10 @@ async def stream_research_events(
             raise ValueError
 
     except ValueError:
-        raise HTTPException(
+        raise AppException(
+            message="Invalid Last-Event-ID",
+            error_code="INVALID_LAST_EVENT_ID",
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid Last-Event-ID",
         )
 
     # 3. Return SSE stream.
@@ -176,4 +188,99 @@ async def stream_research_events(
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },
+    )
+
+
+@router.get(
+    "/{research_id}/report",
+    response_model=ResearchReportResponse,
+)
+async def get_research_report_endpoint(
+    research_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    # Verify research ownership
+    research = await get_research_by_id(
+        db=db,
+        research_id=research_id,
+        user_id=current_user.id,
+    )
+
+    if not research:
+        raise AppException(
+            message="Research not found",
+            error_code="RESEARCH_NOT_FOUND",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+    # Fetch report
+    report = await get_research_report(
+        db=db,
+        research_id=research_id,
+    )
+
+    if not report:
+        raise AppException(
+            message="Research report not found",
+            error_code="RESEARCH_REPORT_NOT_FOUND",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+    return report
+
+
+@router.get(
+    "/{research_id}/tasks",
+    response_model=list[ResearchTaskResponse],
+)
+async def get_research_tasks_endpoint(
+    research_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    research = await get_research_by_id(
+        db=db,
+        research_id=research_id,
+        user_id=current_user.id,
+    )
+
+    if not research:
+        raise AppException(
+            message="Research not found",
+            error_code="RESEARCH_NOT_FOUND",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+    return await get_research_tasks(
+        db=db,
+        research_id=research_id,
+    )
+
+
+@router.get(
+    "/{research_id}/sources",
+    response_model=list[ResearchSourceResponse],
+)
+async def get_research_sources_endpoint(
+    research_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    research = await get_research_by_id(
+        db=db,
+        research_id=research_id,
+        user_id=current_user.id,
+    )
+
+    if not research:
+        raise AppException(
+            message="Research not found",
+            error_code="RESEARCH_NOT_FOUND",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+    return await get_research_sources(
+        db=db,
+        research_id=research_id,
     )

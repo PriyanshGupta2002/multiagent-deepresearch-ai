@@ -1,9 +1,10 @@
-from fastapi import Cookie, Depends, HTTPException, status
+from fastapi import Cookie, Depends, status
 from jose import JWTError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.dependencies import get_db
+from app.core.exceptions import AppException
 from app.core.security import decode_access_token
 from app.modules.auth.models import User, UserSession
 
@@ -16,9 +17,10 @@ async def get_current_user(
     db: AsyncSession = Depends(get_db),
 ) -> User:
 
-    credentials_error = HTTPException(
+    credentials_error = AppException(
+        message="Not authenticated",
+        error_code="AUTH_NOT_AUTHENTICATED",
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Not authenticated",
     )
 
     if not access_token:

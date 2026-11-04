@@ -2,6 +2,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime, timedelta, timezone
 from app.core.config import settings
+from app.core.exceptions import AppException
 from app.modules.auth.models import User, UserSession
 from app.modules.auth.schemas import RegisterRequest
 from app.core.security import hash_password, verify_password
@@ -9,6 +10,7 @@ from app.core.security import (
     create_refresh_token,
     hash_refresh_token,
 )
+from fastapi import status
 
 
 async def get_user_by_email(
@@ -26,7 +28,11 @@ async def register_user(
     existing_user = await get_user_by_email(db, data.email)
 
     if existing_user:
-        raise ValueError("Email already registered")
+        raise AppException(
+            message="Email already registered",
+            error_code="AUTH_EMAIL_ALREADY_REGISTERED",
+            status_code=status.HTTP_409_CONFLICT,
+        )
 
     user = User(
         email=data.email.lower(),

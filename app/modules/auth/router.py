@@ -1,7 +1,6 @@
 from fastapi import (
     APIRouter,
     Depends,
-    HTTPException,
     Response,
     Cookie,
     status,
@@ -9,6 +8,7 @@ from fastapi import (
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.dependencies import get_db
+from app.core.exceptions import AppException
 from app.core.security import create_access_token
 from app.modules.auth.models import User
 from app.modules.auth.schemas import (
@@ -41,14 +41,7 @@ async def register(
     data: RegisterRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    try:
-        return await register_user(db, data)
-
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=str(e),
-        )
+    return await register_user(db, data)
 
 
 @router.post("/login", response_model=UserResponse)
@@ -64,9 +57,10 @@ async def login(
     )
 
     if not user:
-        raise HTTPException(
+        raise AppException(
+            message="Invalid email or password",
+            error_code="AUTH_INVALID_CREDENTIALS",
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password",
         )
 
     session, refresh_token = await create_user_session(db, user)
@@ -95,9 +89,10 @@ async def refresh(
     db: AsyncSession = Depends(get_db),
 ):
     if not refresh_token:
-        raise HTTPException(
+        raise AppException(
+            message="Refresh token missing",
+            error_code="AUTH_REFRESH_TOKEN_MISSING",
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Refresh token missing",
         )
 
     result = await rotate_refresh_token(db, refresh_token)
@@ -105,9 +100,10 @@ async def refresh(
     if not result:
         clear_auth_cookies(response)
 
-        raise HTTPException(
+        raise AppException(
+            message="Invalid or expired refresh token",
+            error_code="AUTH_INVALID_REFRESH_TOKEN",
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired refresh token",
         )
 
     user, session, new_refresh_token = result
