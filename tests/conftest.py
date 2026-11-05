@@ -2,7 +2,7 @@ import os
 import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
-
+from dotenv import load_dotenv
 import pytest
 import pytest_asyncio
 from dotenv import dotenv_values
@@ -15,9 +15,10 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+load_dotenv()
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
-_test_database_url = os.environ.get("TEST_DATABASE_URL")
+_test_database_url = os.getenv("TEST_DATABASE_URL")
 
 if not _test_database_url:
     raise pytest.UsageError(
@@ -35,7 +36,9 @@ def _parse_url(value: str, name: str) -> URL:
     try:
         return make_url(value)
     except (ArgumentError, TypeError) as exc:
-        raise pytest.UsageError(f"{name} must be a valid SQLAlchemy database URL.") from exc
+        raise pytest.UsageError(
+            f"{name} must be a valid SQLAlchemy database URL."
+        ) from exc
 
 
 def _database_identity(url: URL) -> tuple[str, str | None, int | None, str | None]:

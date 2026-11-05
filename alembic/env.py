@@ -18,6 +18,7 @@ from app.modules.research.models import (
     ResearchSource,
     ResearchEvent,
 )
+from app.modules.saved_reports.models import SavedReport
 
 config = context.config
 

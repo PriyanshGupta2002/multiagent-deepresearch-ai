@@ -1,7 +1,11 @@
 from datetime import datetime, timezone
 
 from arq.connections import RedisSettings
-from app.modules.research.services import persist_research_event
+from app.modules.research.services import (
+    ResearchJobNotRunning,
+    lock_running_research_job,
+    persist_research_event,
+)
 from app.core.config import settings
 from app.db.session import AsyncSessionLocal
 from app.modules.auth.models import User
@@ -28,12 +32,35 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+RESEARCH_STATUS_POLL_INTERVAL = 0.25
+
 
 async def health_check(ctx):
     return {
         "status": "worker_running",
         "message": "ARQ worker is ready",
     }
+
+
+async def _read_research_status(research_id: str) -> str:
+    async with AsyncSessionLocal() as db:
+        status_value = await db.scalar(
+            select(ResearchJob.status).where(ResearchJob.id == research_id)
+        )
+
+    if status_value is None:
+        raise ValueError(f"Research job {research_id} not found")
+
+    return status_value
+
+
+async def _wait_for_terminal_research_status(research_id: str) -> str:
+    while True:
+        status_value = await _read_research_status(research_id)
+        if status_value != "running":
+            return status_value
+
+        await asyncio.sleep(RESEARCH_STATUS_POLL_INTERVAL)
 
 
 async def save_research_event(
@@ -55,6 +82,7 @@ async def persist_generated_tasks(
     tasks: list[str],
 ):
     async with AsyncSessionLocal() as db:
+        await lock_running_research_job(db, research_id)
 
         for task in tasks:
             db.add(
@@ -76,6 +104,7 @@ async def update_research_task(
     error: str | None = None,
 ):
     async with AsyncSessionLocal() as db:
+        await lock_running_research_job(db, research_id)
 
         # Find the latest matching task that has not finished.
         result = await db.execute(
@@ -107,6 +136,120 @@ async def update_research_task(
             task.error = error
 
         await db.commit()
+
+
+async def _finalize_research(
+    research_id: str,
+    final_state: dict,
+    structured_content: dict,
+    aggregated,
+) -> str:
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(ResearchJob)
+            .where(ResearchJob.id == research_id)
+            .with_for_update()
+        )
+        job = result.scalar_one_or_none()
+
+        if not job:
+            raise ValueError(f"Research job {research_id} not found")
+
+        if job.status != "running":
+            current_status = job.status
+            await db.rollback()
+            logger.info(
+                "Not completing research %s because its status is %s",
+                research_id,
+                current_status,
+            )
+            return current_status
+
+        job.status = "completed"
+        job.completed_at = datetime.now(timezone.utc)
+
+        db.add(
+            ResearchReport(
+                research_id=research_id,
+                content=final_state["final_research"],
+                structured_content=structured_content,
+            )
+        )
+
+        seen_urls = set()
+        for source in aggregated.sources:
+            if source.url in seen_urls:
+                continue
+
+            seen_urls.add(source.url)
+            db.add(
+                ResearchSource(
+                    research_id=research_id,
+                    url=source.url,
+                    title=source.title,
+                    source_metadata={"published_date": source.published_date},
+                )
+            )
+
+        result = await db.execute(
+            select(func.coalesce(func.max(ResearchEvent.sequence), 0)).where(
+                ResearchEvent.research_id == research_id
+            )
+        )
+        next_sequence = result.scalar_one() + 1
+
+        db.add(
+            ResearchEvent(
+                research_id=research_id,
+                event_type="research_completed",
+                payload={
+                    "status": "completed",
+                    "retry_count": final_state["retry_count"],
+                    "critic_score": final_state["critic_score"],
+                },
+                sequence=next_sequence,
+            )
+        )
+
+        await db.commit()
+        return "completed"
+
+
+async def _mark_research_failed(research_id: str, error: str) -> bool:
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(ResearchJob)
+            .where(ResearchJob.id == research_id)
+            .with_for_update()
+        )
+        job = result.scalar_one_or_none()
+
+        if job is None or job.status != "running":
+            await db.rollback()
+            return False
+
+        job.status = "failed"
+        job.error = error
+        job.completed_at = datetime.now(timezone.utc)
+
+        result = await db.execute(
+            select(func.coalesce(func.max(ResearchEvent.sequence), 0)).where(
+                ResearchEvent.research_id == research_id
+            )
+        )
+        next_sequence = result.scalar_one() + 1
+
+        db.add(
+            ResearchEvent(
+                research_id=research_id,
+                event_type="research_failed",
+                payload={"status": "failed", "error": error},
+                sequence=next_sequence,
+            )
+        )
+
+        await db.commit()
+        return True
 
 
 async def run_research(ctx, research_id: str):
@@ -196,160 +339,245 @@ async def run_research(ctx, research_id: str):
         # 5. Execute research graph
         final_state = None
 
-        async for event in research_graph.astream_events(
+        graph_events = research_graph.astream_events(
             initial_state,
             version="v2",
             config=graph_config,
-        ):
-            event_name = event.get("event")
-            node_name = event.get("name")
-            event_data = event.get("data", {})
-            metadata = event.get("metadata", {})
+        )
+        event_task = asyncio.create_task(anext(graph_events))
+        watcher_task = asyncio.create_task(
+            _wait_for_terminal_research_status(research_id)
+        )
 
-            # ------------------------------------------
-            # A. Custom researcher events
-            # ------------------------------------------
-
-            if event_name == "on_custom_event":
-                custom_name = node_name
-                payload = event_data if isinstance(event_data, dict) else {}
-
-                subtask = payload.get("subtask")
-
-                if custom_name == "researcher_started":
-                    await update_research_task(
-                        research_id=research_id,
-                        subtask=subtask,
-                        status="running",
-                    )
-
-                elif custom_name == "researcher_completed":
-                    await update_research_task(
-                        research_id=research_id,
-                        subtask=subtask,
-                        status="completed",
-                    )
-
-                elif custom_name == "researcher_failed":
-                    await update_research_task(
-                        research_id=research_id,
-                        subtask=subtask,
-                        status="failed",
-                        error=payload.get("error"),
-                    )
-
-                await save_research_event(
-                    research_id,
-                    custom_name,
-                    payload,
+        try:
+            while True:
+                done, _ = await asyncio.wait(
+                    {event_task, watcher_task},
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
 
-                print(f"[EVENT SAVED] {custom_name}")
+                if event_task in done:
+                    try:
+                        event = event_task.result()
+                    except StopAsyncIteration:
+                        break
+                    except asyncio.CancelledError:
+                        if asyncio.current_task().cancelling():
+                            raise
+                        if watcher_task.done():
+                            return {
+                                "status": watcher_task.result(),
+                                "research_id": research_id,
+                            }
+                        status_value = await _read_research_status(research_id)
+                        if status_value != "running":
+                            return {
+                                "status": status_value,
+                                "research_id": research_id,
+                            }
+                        raise RuntimeError(
+                            f"Research graph task for {research_id} was "
+                            "cancelled unexpectedly."
+                        )
+                    except Exception:
+                        if watcher_task.done():
+                            return {
+                                "status": watcher_task.result(),
+                                "research_id": research_id,
+                            }
+                        raise
 
-                continue
+                else:
+                    terminal_status = watcher_task.result()
 
-            # ------------------------------------------
-            # B. Actual LangGraph node lifecycle events
-            # ------------------------------------------
+                    # The graph may have completed between wait() returning
+                    # and this check. Let its output reach the DB finalizer.
+                    if event_task.done():
+                        continue
 
-            graph_node = metadata.get("langgraph_node")
+                    event_task.cancel()
+                    try:
+                        await event_task
+                    except asyncio.CancelledError:
+                        if asyncio.current_task().cancelling():
+                            raise
 
-            tracked_nodes = {
-                "supervisor",
-                "aggregator",
-                "critic",
-                "retry",
-                "final_report",
-            }
+                    return {
+                        "status": terminal_status,
+                        "research_id": research_id,
+                    }
 
-            if graph_node in tracked_nodes and node_name == graph_node:
+                event_name = event.get("event")
+                node_name = event.get("name")
+                event_data = event.get("data", {})
+                metadata = event.get("metadata", {})
 
-                if event_name == "on_chain_start":
+                # ------------------------------------------
+                # A. Custom researcher events
+                # ------------------------------------------
+
+                if event_name == "on_custom_event":
+                    custom_name = node_name
+                    payload = event_data if isinstance(event_data, dict) else {}
+
+                    subtask = payload.get("subtask")
+
+                    if custom_name == "researcher_started":
+                        await update_research_task(
+                            research_id=research_id,
+                            subtask=subtask,
+                            status="running",
+                        )
+
+                    elif custom_name == "researcher_completed":
+                        await update_research_task(
+                            research_id=research_id,
+                            subtask=subtask,
+                            status="completed",
+                        )
+
+                    elif custom_name == "researcher_failed":
+                        await update_research_task(
+                            research_id=research_id,
+                            subtask=subtask,
+                            status="failed",
+                            error=payload.get("error"),
+                        )
+
                     await save_research_event(
                         research_id,
-                        f"{graph_node}_started",
-                        {},
+                        custom_name,
+                        payload,
                     )
 
-                    print(f"[NODE STARTED] {graph_node}")
+                    print(f"[EVENT SAVED] {custom_name}")
 
-                elif event_name == "on_chain_end":
-                    output = event_data.get("output", {})
+                    event_task = asyncio.create_task(anext(graph_events))
+                    continue
 
-                    if not isinstance(output, dict):
-                        output = {}
+                # ------------------------------------------
+                # B. Actual LangGraph node lifecycle events
+                # ------------------------------------------
 
-                    # Supervisor: persist generated tasks
-                    if graph_node == "supervisor":
-                        tasks = output.get("tasks", [])
+                graph_node = metadata.get("langgraph_node")
 
-                        if tasks:
-                            await persist_generated_tasks(
-                                research_id=research_id,
-                                tasks=tasks,
-                            )
+                tracked_nodes = {
+                    "supervisor",
+                    "aggregator",
+                    "critic",
+                    "retry",
+                    "final_report",
+                }
 
-                            await save_research_event(
-                                research_id,
-                                "tasks_generated",
-                                {
-                                    "tasks": tasks,
-                                    "total_tasks": len(tasks),
-                                },
-                            )
+                if graph_node in tracked_nodes and node_name == graph_node:
 
-                            print(f"[TASKS SAVED] {len(tasks)} tasks")
-
-                    # Aggregator completed
-                    elif graph_node == "aggregator":
+                    if event_name == "on_chain_start":
                         await save_research_event(
                             research_id,
-                            "aggregator_completed",
+                            f"{graph_node}_started",
                             {},
                         )
 
-                    # Critic completed
-                    elif graph_node == "critic":
-                        await save_research_event(
-                            research_id,
-                            "critic_completed",
-                            {
-                                "critic_score": output.get("critic_score"),
-                                "critic_acceptable": output.get("critic_acceptable"),
-                                "critic_feedback": output.get("critic_feedback"),
-                                "retry_tasks": output.get("retry_tasks", []),
-                            },
-                        )
+                        print(f"[NODE STARTED] {graph_node}")
 
-                    # Retry completed
-                    elif graph_node == "retry":
-                        await save_research_event(
-                            research_id,
-                            "retry_completed",
-                            {
-                                "retry_count": output.get("retry_count"),
-                                "retry_tasks": output.get("retry_tasks", []),
-                            },
-                        )
+                    elif event_name == "on_chain_end":
+                        output = event_data.get("output", {})
 
-                    # Final report completed
-                    elif graph_node == "final_report":
-                        await save_research_event(
-                            research_id,
-                            "final_report_completed",
-                            {
-                                "report_generated": bool(output.get("final_research")),
-                            },
-                        )
+                        if not isinstance(output, dict):
+                            output = {}
 
-                    print(f"[NODE COMPLETED] {graph_node}")
+                        # Supervisor: persist generated tasks
+                        if graph_node == "supervisor":
+                            tasks = output.get("tasks", [])
 
-            # ------------------------------------------
-            # C. Capture root graph output
-            # ------------------------------------------
+                            if tasks:
+                                await persist_generated_tasks(
+                                    research_id=research_id,
+                                    tasks=tasks,
+                                )
 
-            if event_name == "on_chain_end" and not event.get("parent_ids"):
-                final_state = event_data.get("output")
+                                await save_research_event(
+                                    research_id,
+                                    "tasks_generated",
+                                    {
+                                        "tasks": tasks,
+                                        "total_tasks": len(tasks),
+                                    },
+                                )
+
+                                print(f"[TASKS SAVED] {len(tasks)} tasks")
+
+                        # Aggregator completed
+                        elif graph_node == "aggregator":
+                            await save_research_event(
+                                research_id,
+                                "aggregator_completed",
+                                {},
+                            )
+
+                        # Critic completed
+                        elif graph_node == "critic":
+                            await save_research_event(
+                                research_id,
+                                "critic_completed",
+                                {
+                                    "critic_score": output.get("critic_score"),
+                                    "critic_acceptable": output.get("critic_acceptable"),
+                                    "critic_feedback": output.get("critic_feedback"),
+                                    "retry_tasks": output.get("retry_tasks", []),
+                                },
+                            )
+
+                        # Retry completed
+                        elif graph_node == "retry":
+                            await save_research_event(
+                                research_id,
+                                "retry_completed",
+                                {
+                                    "retry_count": output.get("retry_count"),
+                                    "retry_tasks": output.get("retry_tasks", []),
+                                },
+                            )
+
+                        # Final report completed
+                        elif graph_node == "final_report":
+                            await save_research_event(
+                                research_id,
+                                "final_report_completed",
+                                {
+                                    "report_generated": bool(output.get("final_research")),
+                                },
+                            )
+
+                        print(f"[NODE COMPLETED] {graph_node}")
+
+                # ------------------------------------------
+                # C. Capture root graph output
+                # ------------------------------------------
+
+                if event_name == "on_chain_end" and not event.get("parent_ids"):
+                    final_state = event_data.get("output")
+
+                event_task = asyncio.create_task(anext(graph_events))
+        finally:
+            if not watcher_task.done():
+                watcher_task.cancel()
+            if not event_task.done():
+                event_task.cancel()
+            await asyncio.gather(
+                watcher_task,
+                event_task,
+                return_exceptions=True,
+            )
+            close_graph_events = getattr(graph_events, "aclose", None)
+            if close_graph_events is not None:
+                try:
+                    await close_graph_events()
+                except (Exception, asyncio.CancelledError):
+                    logger.exception(
+                        "Failed to close research graph iterator for %s.",
+                        research_id,
+                    )
 
         # ----------------------------------------------
         # 6. Validate final graph output
@@ -384,68 +612,15 @@ async def run_research(ctx, research_id: str):
         #    event in one transaction
         # ----------------------------------------------
 
-        async with AsyncSessionLocal() as db:
+        terminal_status = await _finalize_research(
+            research_id=research_id,
+            final_state=final_state,
+            structured_content=structured_content,
+            aggregated=aggregated,
+        )
 
-            report = ResearchReport(
-                research_id=research_id,
-                content=final_state["final_research"],
-                structured_content=structured_content,
-            )
-
-            db.add(report)
-
-            # Deduplicate sources by URL
-            seen_urls = set()
-
-            for source in aggregated.sources:
-                if source.url in seen_urls:
-                    continue
-
-                seen_urls.add(source.url)
-
-                db.add(
-                    ResearchSource(
-                        research_id=research_id,
-                        url=source.url,
-                        title=source.title,
-                        source_metadata={
-                            "published_date": source.published_date,
-                        },
-                    )
-                )
-
-            job = await db.get(ResearchJob, research_id)
-
-            if not job:
-                raise ValueError(f"Research job {research_id} not found")
-
-            job.status = "completed"
-            job.completed_at = datetime.now(timezone.utc)
-
-            # Calculate next event sequence
-
-            result = await db.execute(
-                select(func.coalesce(func.max(ResearchEvent.sequence), 0)).where(
-                    ResearchEvent.research_id == research_id
-                )
-            )
-
-            next_sequence = result.scalar_one() + 1
-
-            db.add(
-                ResearchEvent(
-                    research_id=research_id,
-                    event_type="research_completed",
-                    payload={
-                        "status": "completed",
-                        "retry_count": final_state["retry_count"],
-                        "critic_score": final_state["critic_score"],
-                    },
-                    sequence=next_sequence,
-                )
-            )
-
-            await db.commit()
+        if terminal_status != "completed":
+            return {"status": terminal_status, "research_id": research_id}
 
         print(f"[RESEARCH COMPLETED] {research_id}")
 
@@ -460,38 +635,15 @@ async def run_research(ctx, research_id: str):
             research_id,
         )
         raise
+    except ResearchJobNotRunning as exc:
+        logger.info(
+            "Stopping research %s because its status is %s",
+            research_id,
+            exc.status,
+        )
+        return {"status": exc.status, "research_id": research_id}
     except Exception as e:
-
-        async with AsyncSessionLocal() as db:
-
-            job = await db.get(ResearchJob, research_id)
-
-            if job:
-                job.status = "failed"
-                job.error = str(e)
-                job.completed_at = datetime.now(timezone.utc)
-
-                result = await db.execute(
-                    select(func.coalesce(func.max(ResearchEvent.sequence), 0)).where(
-                        ResearchEvent.research_id == research_id
-                    )
-                )
-
-                next_sequence = result.scalar_one() + 1
-
-                db.add(
-                    ResearchEvent(
-                        research_id=research_id,
-                        event_type="research_failed",
-                        payload={
-                            "status": "failed",
-                            "error": str(e),
-                        },
-                        sequence=next_sequence,
-                    )
-                )
-
-                await db.commit()
+        await _mark_research_failed(research_id, str(e))
 
         print(f"[RESEARCH FAILED] {research_id}: {e}")
 

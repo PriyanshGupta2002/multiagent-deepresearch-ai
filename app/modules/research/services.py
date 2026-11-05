@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 import json
+import logging
 from sqlalchemy import select, desc, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -11,9 +12,49 @@ from app.db.session import AsyncSessionLocal
 from fastapi import Request
 
 import asyncio
-from arq.jobs import Job, JobStatus
+from arq.jobs import Job
 from app.modules.research.models import ResearchReport, ResearchTask, ResearchSource
 from fastapi import status
+
+logger = logging.getLogger(__name__)
+
+TERMINAL_RESEARCH_EVENT_TYPES = {
+    "research_completed",
+    "research_failed",
+    "research_cancelled",
+}
+
+
+class ResearchJobNotRunning(RuntimeError):
+    def __init__(self, research_id: str, status_value: str):
+        self.research_id = research_id
+        self.status = status_value
+        super().__init__(
+            f"Research job {research_id} is {status_value}, not running."
+        )
+
+
+async def lock_running_research_job(
+    db: AsyncSession,
+    research_id: str,
+) -> ResearchJob:
+    result = await db.execute(
+        select(ResearchJob)
+        .where(ResearchJob.id == research_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    research = result.scalar_one_or_none()
+
+    if research is None:
+        raise ValueError(f"Research job {research_id} not found")
+
+    if research.status != "running":
+        current_status = research.status
+        await db.rollback()
+        raise ResearchJobNotRunning(research_id, current_status)
+
+    return research
 
 
 async def mark_research_enqueue_failed(
@@ -21,32 +62,46 @@ async def mark_research_enqueue_failed(
     research: ResearchJob,
     error: str,
 ) -> None:
-
-    research.status = "failed"
-    research.error = error
-    research.completed_at = datetime.now(timezone.utc)
-
-    result = await db.execute(
-        select(func.coalesce(func.max(ResearchEvent.sequence), 0)).where(
-            ResearchEvent.research_id == research.id
+    try:
+        result = await db.execute(
+            select(ResearchJob)
+            .where(ResearchJob.id == research.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
-    )
+        locked_research = result.scalar_one_or_none()
 
-    next_sequence = result.scalar_one() + 1
+        if locked_research is None or locked_research.status != "queued":
+            await db.rollback()
+            return
 
-    db.add(
-        ResearchEvent(
-            research_id=research.id,
-            event_type="research_failed",
-            payload={
-                "status": "failed",
-                "error": error,
-            },
-            sequence=next_sequence,
+        locked_research.status = "failed"
+        locked_research.error = error
+        locked_research.completed_at = datetime.now(timezone.utc)
+
+        result = await db.execute(
+            select(func.coalesce(func.max(ResearchEvent.sequence), 0)).where(
+                ResearchEvent.research_id == locked_research.id
+            )
         )
-    )
+        next_sequence = result.scalar_one() + 1
 
-    await db.commit()
+        db.add(
+            ResearchEvent(
+                research_id=locked_research.id,
+                event_type="research_failed",
+                payload={
+                    "status": "failed",
+                    "error": error,
+                },
+                sequence=next_sequence,
+            )
+        )
+
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
 
 
 async def create_research(
@@ -127,69 +182,16 @@ async def cancel_research(
     redis_pool,
 ) -> ResearchJob:
     """
-    Abort the ARQ job and persist the cancellation state and event.
+    Persist cancellation before requesting that ARQ stop the worker.
     """
-
-    # 1. Refresh research status
-    await db.refresh(research)
-
-    if research.status not in {"queued", "running"}:
-        raise AppException(
-            message=f"Cannot cancel research with status: {research.status}",
-            error_code="RESEARCH_CANCELLATION_CONFLICT",
-            status_code=status.HTTP_409_CONFLICT,
-        )
-
-    # 2. Identify the corresponding ARQ job
-    job_id = f"research:{research.id}"
-
-    arq_job = Job(
-        job_id=job_id,
-        redis=redis_pool,
-        _queue_name="deepresearch",
-    )
-
-    # 3. Check current ARQ job status
-    arq_status = await arq_job.status()
-
-    if arq_status in {JobStatus.queued, JobStatus.deferred}:
-
-        try:
-            await arq_job.abort(
-                timeout=2,
-                poll_delay=0.2,
-            )
-
-        except asyncio.TimeoutError:
-            # Abort request is registered in Redis.
-            # Worker will process it when available.
-            pass
-
-    elif arq_status == JobStatus.in_progress:
-
-        aborted = await arq_job.abort(
-            timeout=10,
-            poll_delay=0.2,
-        )
-
-        if not aborted:
-            raise AppException(
-                message="Could not abort the running research job.",
-                error_code="RESEARCH_CANCELLATION_CONFLICT",
-                status_code=status.HTTP_409_CONFLICT,
-            )
-
-    else:
-        raise AppException(
-            message=f"ARQ job cannot be cancelled. Current status: {arq_status}",
-            error_code="RESEARCH_CANCELLATION_CONFLICT",
-            status_code=status.HTTP_409_CONFLICT,
-        )
-
-    # 4. Lock research row and update database atomically
+    research_id = research.id
+    already_cancelled = False
     try:
         result = await db.execute(
-            select(ResearchJob).where(ResearchJob.id == research.id).with_for_update()
+            select(ResearchJob)
+            .where(ResearchJob.id == research_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
 
         locked_research = result.scalar_one_or_none()
@@ -201,49 +203,79 @@ async def cancel_research(
                 status_code=status.HTTP_409_CONFLICT,
             )
 
-        # Recheck status after acquiring the lock
-        if locked_research.status not in {"queued", "running"}:
+        # Recheck status after acquiring the lock. A retry may re-request
+        # the ARQ abort, but it must not write a second terminal event.
+        if locked_research.status == "cancelled":
+            already_cancelled = True
+            await db.rollback()
+        elif locked_research.status not in {"queued", "running"}:
             raise AppException(
                 message=f"Cannot cancel research with status: {locked_research.status}",
                 error_code="RESEARCH_CANCELLATION_CONFLICT",
                 status_code=status.HTTP_409_CONFLICT,
             )
+        else:
+            locked_research.status = "cancelled"
+            locked_research.completed_at = datetime.now(timezone.utc)
 
-        # Update research status
-        locked_research.status = "cancelled"
-        locked_research.completed_at = datetime.now(timezone.utc)
-
-        # 5. Generate next event sequence
-        result = await db.execute(
-            select(func.coalesce(func.max(ResearchEvent.sequence), 0)).where(
-                ResearchEvent.research_id == locked_research.id
+            result = await db.execute(
+                select(func.coalesce(func.max(ResearchEvent.sequence), 0)).where(
+                    ResearchEvent.research_id == research_id
+                )
             )
-        )
+            next_sequence = result.scalar_one() + 1
 
-        next_sequence = result.scalar_one() + 1
+            db.add(
+                ResearchEvent(
+                    research_id=research_id,
+                    event_type="research_cancelled",
+                    payload={
+                        "status": "cancelled",
+                        "message": "Research was cancelled by the user.",
+                    },
+                    sequence=next_sequence,
+                )
+            )
 
-        # 6. Persist cancellation event
-        cancellation_event = ResearchEvent(
-            research_id=locked_research.id,
-            event_type="research_cancelled",
-            payload={
-                "status": "cancelled",
-                "message": "Research was cancelled by the user.",
-            },
-            sequence=next_sequence,
-        )
-
-        db.add(cancellation_event)
-
-        # 7. Commit transaction
-        await db.commit()
-        await db.refresh(locked_research)
-
-        return locked_research
+            # Commit before ARQ abort so the database transition is authoritative.
+            await db.commit()
 
     except Exception:
         await db.rollback()
         raise
+
+    try:
+        arq_job = Job(
+            job_id=f"research:{research_id}",
+            redis=redis_pool,
+            _queue_name="deepresearch",
+        )
+        aborted = await arq_job.abort(timeout=10, poll_delay=0.2)
+        if not aborted:
+            logger.warning(
+                "Research %s was marked cancelled, but its ARQ job "
+                "did not confirm abort.",
+                research_id,
+            )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Research %s was marked cancelled, but the ARQ abort timed out.",
+            research_id,
+        )
+    except Exception:
+        logger.exception(
+            "Research %s was marked cancelled, but its ARQ abort failed.",
+            research_id,
+        )
+
+    if already_cancelled:
+        raise AppException(
+            message="Cannot cancel research with status: cancelled",
+            error_code="RESEARCH_CANCELLATION_CONFLICT",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+    return locked_research
 
 
 async def persist_research_event(
@@ -254,17 +286,12 @@ async def persist_research_event(
 ) -> ResearchEvent:
 
     try:
-        # Lock the parent research row.
-        # Concurrent event writers for the same research
-        # must wait until the current transaction completes.
-        result = await db.execute(
-            select(ResearchJob).where(ResearchJob.id == research_id).with_for_update()
-        )
+        if event_type in TERMINAL_RESEARCH_EVENT_TYPES:
+            raise ValueError(
+                f"{event_type} must be persisted with its terminal state transition."
+            )
 
-        research = result.scalar_one_or_none()
-
-        if not research:
-            raise ValueError(f"Research not found: {research_id}")
+        await lock_running_research_job(db, research_id)
 
         # Fetch the latest event sequence.
         result = await db.execute(

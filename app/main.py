@@ -17,6 +17,7 @@ from app.core.queue import create_redis_pool
 
 from app.modules.auth.router import router as auth_router
 from app.modules.research.router import router as research_router
+from app.modules.saved_reports.router import router as saved_reports_router
 
 
 @asynccontextmanager
@@ -47,7 +48,7 @@ app.add_middleware(
     allow_origins=[settings.FRONTEND_URL],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
-    allow_headers=["Content-Type", "X-CSRF-Token"],
+    allow_headers=["Content-Type", "X-CSRF-Token", "Last-Event-ID"],
 )
 
 
@@ -71,5 +72,10 @@ app.include_router(
 
 app.include_router(
     research_router,
+    prefix=settings.API_V1_PREFIX,
+)
+
+app.include_router(
+    saved_reports_router,
     prefix=settings.API_V1_PREFIX,
 )
