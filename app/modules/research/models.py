@@ -10,7 +10,7 @@ from sqlalchemy import (
     JSON,
     Index,
 )
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
 
@@ -76,6 +76,13 @@ class ResearchJob(Base):
         DateTime(timezone=True),
         default=utc_now,
         nullable=False,
+    )
+
+    conversations: Mapped[list["ResearchConversation"]] = relationship(
+        "ResearchConversation",
+        back_populates="research",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
     )
 
 

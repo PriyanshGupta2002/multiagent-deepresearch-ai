@@ -13,11 +13,16 @@ from app.core.exceptions import (
     unexpected_exception_handler,
     validation_exception_handler,
 )
+from app.modules.conversations.models import (
+    ResearchConversation,
+    ResearchMessage,
+)
 from app.core.queue import create_redis_pool
 
 from app.modules.auth.router import router as auth_router
 from app.modules.research.router import router as research_router
 from app.modules.saved_reports.router import router as saved_reports_router
+from app.modules.conversations.router import router as conversations_router
 
 
 @asynccontextmanager
@@ -79,3 +84,5 @@ app.include_router(
     saved_reports_router,
     prefix=settings.API_V1_PREFIX,
 )
+
+app.include_router(conversations_router, prefix=settings.API_V1_PREFIX)

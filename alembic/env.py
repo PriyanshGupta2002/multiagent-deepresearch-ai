@@ -19,6 +19,10 @@ from app.modules.research.models import (
     ResearchEvent,
 )
 from app.modules.saved_reports.models import SavedReport
+from app.modules.conversations.models import (
+    ResearchConversation,
+    ResearchMessage,
+)
 
 config = context.config
 
