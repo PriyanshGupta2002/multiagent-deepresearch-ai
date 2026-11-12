@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
-
+from prometheus_fastapi_instrumentator import Instrumentator
 from app.core.config import settings
 from app.core.exceptions import (
     AppException,
@@ -63,6 +63,9 @@ async def read_root():
         "message": "Welcome to DeepResearch AI",
         "status": "running",
     }
+
+
+Instrumentator().instrument(app).expose(app, endpoint="/metrics")
 
 
 @app.get("/health")

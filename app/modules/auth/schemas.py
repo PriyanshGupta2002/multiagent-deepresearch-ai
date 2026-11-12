@@ -17,6 +17,7 @@ class UserResponse(BaseModel):
     email: EmailStr
     full_name: str
     is_active: bool
+    access_token: str
 
     model_config = ConfigDict(from_attributes=True)
 
